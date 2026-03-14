@@ -174,66 +174,98 @@ def _default_formats():
     ]
 
 def _video_formats(info):
+    """
+    Collect all available video qualities from yt-dlp info.
+
+    YouTube (and many other platforms) deliver most resolutions above 360p as
+    video-only streams (acodec == 'none').  We pick the *best* format_id per
+    (height, fps-bucket) across both muxed and video-only streams, then append
+    '+bestaudio' for video-only ones so yt-dlp will merge them automatically.
+    """
+    # Pass 1: gather best format per (height, fps_key) from ALL video streams
+    # key -> best candidate dict
+    best: dict = {}
+
+    for f in (info.get('formats') or []):
+        vcodec = f.get('vcodec', 'none') or 'none'
+        if vcodec == 'none':
+            continue  # skip audio-only streams
+
+        height = f.get('height')
+        if not height:
+            continue
+
+        fps = f.get('fps') or 0
+        # Bucket fps: treat anything >= 48 as "HFR" so 30p and 60p stay separate
+        fps_key = 'hfr' if fps >= 48 else 'normal'
+        key = (height, fps_key)
+
+        acodec     = f.get('acodec', 'none') or 'none'
+        is_muxed   = acodec != 'none'
+        size_bytes = f.get('filesize') or f.get('filesize_approx') or 0
+
+        candidate = {
+            'format_id':       f['format_id'],
+            'quality':         f'{height}p{"60" if fps_key == "hfr" else ""}',
+            'ext':             f.get('ext', 'mp4'),
+            'fps':             str(int(fps)) if fps else '',
+            'vcodec':          vcodec.split('.')[0],
+            'is_muxed':        is_muxed,
+            'size_bytes':      size_bytes,
+            'height':          height,
+        }
+
+        if key not in best:
+            best[key] = candidate
+        else:
+            prev = best[key]
+            # Prefer muxed over video-only (simpler); otherwise prefer larger size
+            if (not prev['is_muxed'] and is_muxed) or \
+               (prev['is_muxed'] == is_muxed and size_bytes > prev['size_bytes']):
+                best[key] = candidate
+
+    # Pass 2: build final list
     formats = []
-    seen    = set()
+    for candidate in best.values():
+        is_muxed   = candidate['is_muxed']
+        size_bytes = candidate['size_bytes']
 
-    for f in (info.get('formats') or []):
-        vcodec = f.get('vcodec', 'none')
-        acodec = f.get('acodec', 'none')
-        if vcodec != 'none' and acodec != 'none':
-            height = f.get('height')
-            ext    = f.get('ext', 'mp4')
-            fps    = f.get('fps') or 0
-            key    = (height, ext)
-            if height and key not in seen:
-                seen.add(key)
-                size_bytes = f.get('filesize') or f.get('filesize_approx', 0)
-                formats.append({
-                    'format_id':       f['format_id'],
-                    'quality':         f'{height}p',
-                    'ext':             ext,
-                    'size':            format_size(size_bytes) if size_bytes else '?',
-                    'fps':             str(int(fps)) if fps else '',
-                    'vcodec':          vcodec.split('.')[0],
-                    'type':            'video',
-                    'filesize_approx': size_bytes or 0,
-                })
+        if is_muxed:
+            fmt_id = candidate['format_id']
+        else:
+            # video-only: let yt-dlp merge with the best available audio
+            fmt_id = f'{candidate["format_id"]}+bestaudio'
 
-    # High-res video-only + bestaudio
-    for f in (info.get('formats') or []):
-        vcodec = f.get('vcodec', 'none')
-        acodec = f.get('acodec', 'none')
-        if vcodec != 'none' and acodec == 'none':
-            height = f.get('height')
-            fps    = f.get('fps') or 0
-            key    = (height, 'sep')
-            if height and height >= 1440 and key not in seen:
-                seen.add(key)
-                size_bytes = f.get('filesize') or f.get('filesize_approx', 0)
-                formats.append({
-                    'format_id':       f'{f["format_id"]}+bestaudio',
-                    'quality':         f'{height}p',
-                    'ext':             'mp4',
-                    'size':            format_size(size_bytes) if size_bytes else '?',
-                    'fps':             str(int(fps)) if fps else '',
-                    'vcodec':          vcodec.split('.')[0],
-                    'type':            'video',
-                    'filesize_approx': size_bytes or 0,
-                })
+        formats.append({
+            'format_id':       fmt_id,
+            'quality':         candidate['quality'],
+            'ext':             'mp4' if not is_muxed else candidate['ext'],
+            'size':            format_size(size_bytes) if size_bytes else '?',
+            'fps':             candidate['fps'],
+            'vcodec':          candidate['vcodec'],
+            'type':            'video',
+            'filesize_approx': size_bytes,
+        })
 
-    formats.sort(
-        key=lambda x: int(x['quality'].replace('p', '')) if x['quality'].endswith('p') else 0,
-        reverse=True
-    )
+    # Sort highest quality first
+    def _sort_key(x):
+        q = x['quality']
+        # strip non-digit suffix for numeric sort, keep fps as secondary
+        num = int(''.join(filter(str.isdigit, q.split('p')[0]))) if 'p' in q else 0
+        fps = int(x['fps']) if x['fps'] else 0
+        return (num, fps)
 
-    final    = []
-    seen_q   = set()
+    formats.sort(key=_sort_key, reverse=True)
+
+    # De-duplicate by quality label (keep first/best per label)
+    final  = []
+    seen_q = set()
     for f in formats:
         if f['quality'] not in seen_q:
             seen_q.add(f['quality'])
             final.append(f)
 
-    return final[:10] if final else _default_formats()
+    return final if final else _default_formats()
 
 
 @eel.expose
